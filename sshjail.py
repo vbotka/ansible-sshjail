@@ -1,33 +1,32 @@
 # Copyright (c) 2015-2018, Austin Hyde (@austinhyde)
+
 from __future__ import (absolute_import, division, print_function)
-
-import os
-import pipes
-
-from ansible.errors import AnsibleError
-from ansible.plugins.connection.ssh import Connection as SSHConnection
-from ansible.module_utils._text import to_text
-from ansible.plugins.loader import get_shell_plugin
-from contextlib import contextmanager
-
 __metaclass__ = type
 
+
 DOCUMENTATION = '''
-    connection: sshjail
-    short_description: connect via ssh client binary to jail
+    name: sshjail
+    short_description: connect via SSH client binary to jail
     description:
-        - This connection plugin allows ansible to communicate to the target machines via normal ssh command line.
-    author: Austin Hyde (@austinhyde)
+        - This connection plugin allows Ansible to communicate to the target machines via normal SSH command line.
+    author:
+        - Austin Hyde (@austinhyde)
+        - Vladimir Botka (@vbotka)
+    extends_documentation_fragment:
+        - connection_pipelining
     version_added: historical
     options:
       host:
-          description: Hostname/ip to connect to.
+          description: Hostname/IP to connect to.
           default: inventory_hostname
           vars:
                - name: ansible_host
                - name: ansible_ssh_host
+               - name: delegated_vars['ansible_host']
+               - name: delegated_vars['ansible_ssh_host']
       host_key_checking:
-          description: Determines if ssh should check host keys
+          description: Determines if SSH should check host keys.
+          default: True
           type: boolean
           ini:
               - section: defaults
@@ -49,8 +48,11 @@ DOCUMENTATION = '''
           vars:
               - name: ansible_password
               - name: ansible_ssh_pass
+              - name: ansible_ssh_password
       sshpass_prompt:
-          description: Password prompt that sshpass should search for. Supported by sshpass 1.06 and up
+          description:
+               - Password prompt that sshpass should search for. Supported by sshpass 1.06 and up
+               - Defaults to C(Enter PIN for) when pkcs11_provider is set.
           default: ''
           ini:
               - section: 'ssh_connection'
@@ -82,6 +84,9 @@ DOCUMENTATION = '''
                 version_added: '2.7'
           vars:
               - name: ansible_ssh_common_args
+          cli:
+            - name: ssh_common_args
+          default: ''
       ssh_executable:
           default: ssh
           description:
@@ -129,6 +134,9 @@ DOCUMENTATION = '''
             - key: scp_extra_args
               section: ssh_connection
               version_added: '2.7'
+          cli:
+            - name: scp_extra_args
+          default: ''
       sftp_extra_args:
           description: Extra exclusive to the ``sftp`` CLI
           vars:
@@ -140,6 +148,9 @@ DOCUMENTATION = '''
             - key: sftp_extra_args
               section: ssh_connection
               version_added: '2.7'
+          cli:
+            - name: sftp_extra_args
+          default: ''
       ssh_extra_args:
           description: Extra exclusive to the 'ssh' CLI
           vars:
@@ -151,6 +162,9 @@ DOCUMENTATION = '''
             - key: ssh_extra_args
               section: ssh_connection
               version_added: '2.7'
+          cli:
+            - name: ssh_extra_args
+          default: ''
       reconnection_retries:
           description: Number of attempts to connect.
           default: 0
@@ -176,6 +190,8 @@ DOCUMENTATION = '''
           vars:
             - name: ansible_port
             - name: ansible_ssh_port
+          keyword:
+            - name: port
       remote_user:
           description:
               - User name with which to login to the remote server, normally set by the remote_user keyword.
@@ -188,6 +204,10 @@ DOCUMENTATION = '''
           vars:
             - name: ansible_user
             - name: ansible_ssh_user
+          cli:
+            - name: user
+          keyword:
+            - name: remote_user
       pipelining:
           default: ANSIBLE_PIPELINING
           description:
@@ -310,13 +330,30 @@ DOCUMENTATION = '''
         cli:
             - name: timeout
         type: integer
+      pkcs11_provider:
+        version_added: '2.12'
+        default: ""
+        description:
+          - "PKCS11 SmartCard provider such as opensc, example: /usr/local/lib/opensc-pkcs11.so"
+          - Requires sshpass version 1.06+, sshpass must support the -P option.
+        env: [{name: ANSIBLE_PKCS11_PROVIDER}]
+        ini:
+          - {key: pkcs11_provider, section: ssh_connection}
+        vars:
+          - name: ansible_ssh_pkcs11_provider
 '''
 
-try:
-    from __main__ import display
-except ImportError:
-    from ansible.utils.display import Display
-    display = Display()
+from ansible.errors import AnsibleError
+from ansible.plugins.connection.ssh import Connection as SSHConnection
+from ansible.module_utils._text import to_text
+from ansible.plugins.loader import get_shell_plugin
+from ansible.utils.display import Display
+from contextlib import contextmanager
+
+import os
+import pipes
+
+display = Display()
 
 
 # HACK: Ansible core does classname-based validation checks, to ensure connection plugins inherit directly from a class
@@ -338,6 +375,8 @@ class Connection(ConnectionBase):
         # self.jailspec == jailname
         # self.host == jailhost
         # this way SSHConnection parent class uses the jailhost as the SSH remote host
+        msg = "iocage: inventory_hostname: %s host: %s jailspec: %s\n"
+        display.vv(msg % (self.inventory_hostname, self.host, self.jailspec))
 
         # jail information loaded on first use by match_jail
         self.jid = None
@@ -349,19 +388,26 @@ class Connection(ConnectionBase):
 
     def match_jail(self):
         if self.jid is None:
-            code, stdout, stderr = self._jailhost_command("jls -q jid name host.hostname path")
+            cmd = "jls -q jid name host.hostname host.hostuuid path"
+            code, stdout, stderr = self._jailhost_command(cmd)
+            display.vv("iocage: match_jail: code: %s, stdout: %s, stderr: %s\n" % (code, stdout, stderr))
             if code != 0:
                 display.vvv("JLS stdout: %s" % stdout)
                 raise AnsibleError("jls returned non-zero!")
 
             lines = stdout.strip().split(b'\n')
+            display.vv("iocage: match_jail: lines: %s\n" % lines)
             found = False
             for line in lines:
+                display.vv("iocage: match_jail: line: %s\n" % line)
                 if line.strip() == '':
                     break
 
-                jid, name, hostname, path = to_text(line).strip().split()
-                if name == self.jailspec or hostname == self.jailspec:
+                jid, name, hostname, hostuuid, path = to_text(line).strip().split()
+                msg = "iocage: match_jail: jid: %s, name: %s, hostname: %s, hostuuid: %s, path: %s\n"
+                display.vv(msg % (jid, name, hostname, hostuuid, path))
+                if self.jailspec in (name, hostname, hostuuid):
+                    display.vv("iocage: match_jail: jailspec %s found.\n" % self.jailspec)
                     self.jid = jid
                     self.jname = name
                     self.jpath = path
@@ -373,19 +419,23 @@ class Connection(ConnectionBase):
 
     def get_jail_path(self):
         self.match_jail()
+        display.vv("iocage: get_jail_path: jpath: %s\n" % self.jpath)
         return self.jpath
 
     def get_jail_id(self):
         self.match_jail()
+        display.vv("iocage: get_jail_id: jid: %s\n" % self.jid)
         return self.jid
 
     def get_jail_connector(self):
         if self.connector is None:
             code, _, _ = self._jailhost_command("which -s jailme")
+            display.vv("iocage: get_jail_connector: code: %s\n" % code)
             if code != 0:
                 self.connector = 'jexec'
             else:
                 self.connector = 'jailme'
+        display.vv("iocage: get_jail_connector: connector: %s\n" % self.connector)
         return self.connector
 
     def _strip_sudo(self, executable, cmd):
@@ -394,9 +444,10 @@ class Connection(ConnectionBase):
         # Get the quotes
         quotes = sudoless.partition('echo')[0]
         # Get the string between the quotes
-        cmd = sudoless[len(quotes):-len(quotes+'?')]
+        cmd = sudoless[len(quotes):-len(quotes + '?')]
         # Drop the first command becasue we don't need it
         cmd = cmd.split('; ', 1)[1]
+        display.vv("iocage: _strip_sudo: cmd: %s\n" % cmd)
         return cmd
 
     def _strip_sleep(self, cmd):
@@ -404,6 +455,7 @@ class Connection(ConnectionBase):
         cmd = cmd.split(' && sleep 0', 1)[0]
         # Add back trailing quote
         cmd = '%s%s' % (cmd, "'")
+        display.vv("iocage: _strip_sleep: cmd: %s\n" % cmd)
         return cmd
 
     def _jailhost_command(self, cmd):
@@ -411,6 +463,8 @@ class Connection(ConnectionBase):
 
     def exec_command(self, cmd, in_data=None, executable='/bin/sh', sudoable=True):
         ''' run a command in the jail '''
+        msg = "iocage: exec_command: cmd: %s, in_data: %s, executable: %s, sudoable: %s\n"
+        display.vv(msg % (cmd, in_data, executable, sudoable))
         slpcmd = False
 
         if '&& sleep 0' in cmd:
